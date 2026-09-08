@@ -93,39 +93,55 @@ with tab_rule:
 
         total_slides = len(screens)
         slides_with_code = sum(1 for s in screens if s.get("screen_code"))
-        issue_count = len(issues)
+        code_ratio = slides_with_code / total_slides if total_slides else 0
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("전체 슬라이드 수", total_slides)
-        col2.metric("화면코드가 있는 슬라이드 수", slides_with_code)
-        col3.metric("검출 이슈 건수", issue_count)
+        no_code_warning = (
+            "이 문서에서 화면코드를 찾지 못했습니다.\n"
+            "화면코드 형식이 지원 패턴과 다를 수 있습니다."
+        )
 
-        if issue_count == 0:
-            st.success("검출된 이슈가 없습니다")
+        if slides_with_code == 0:
+            # 화면코드가 하나도 없으면 검사 결과 자체가 의미 없으므로 경고만 보여준다.
+            st.warning(no_code_warning)
         else:
-            df = pd.DataFrame(issues, columns=FIELDNAMES)
+            # 검출은 됐지만 비율이 낮으면(10% 미만) 놓친 화면코드가 있을 수 있다는
+            # 경고를 결과와 함께 보여준다(결과 자체는 숨기지 않는다).
+            if code_ratio < 0.1:
+                st.warning(no_code_warning)
 
-            issue_types = sorted(df["issue_type"].unique().tolist())
-            # key를 업로드된 파일에 묶어서, 새 파일이 오면 필터 위젯도 새로
-            # 시작하도록 한다(이전 파일에서 고른 선택이 남아있지 않게).
-            selected_types = st.multiselect(
-                "검사 항목 필터",
-                options=issue_types,
-                key=f"issue_type_filter_{current_file_id}",
-                placeholder="전체 표시 중 (항목을 선택하면 필터링됩니다)",
-            )
-            # 선택한 항목이 없으면 "필터 없음 = 전체 보기"로 취급한다.
-            filtered_df = df if not selected_types else df[df["issue_type"].isin(selected_types)]
+            issue_count = len(issues)
 
-            st.dataframe(filtered_df, use_container_width=True)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("전체 슬라이드 수", total_slides)
+            col2.metric("화면코드가 있는 슬라이드 수", slides_with_code)
+            col3.metric("검출 이슈 건수", issue_count)
 
-            csv_bytes = filtered_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "CSV 다운로드",
-                data=csv_bytes,
-                file_name="issues.csv",
-                mime="text/csv",
-            )
+            if issue_count == 0:
+                st.success("검출된 이슈가 없습니다")
+            else:
+                df = pd.DataFrame(issues, columns=FIELDNAMES)
+
+                issue_types = sorted(df["issue_type"].unique().tolist())
+                # key를 업로드된 파일에 묶어서, 새 파일이 오면 필터 위젯도 새로
+                # 시작하도록 한다(이전 파일에서 고른 선택이 남아있지 않게).
+                selected_types = st.multiselect(
+                    "검사 항목 필터",
+                    options=issue_types,
+                    key=f"issue_type_filter_{current_file_id}",
+                    placeholder="전체 표시 중 (항목을 선택하면 필터링됩니다)",
+                )
+                # 선택한 항목이 없으면 "필터 없음 = 전체 보기"로 취급한다.
+                filtered_df = df if not selected_types else df[df["issue_type"].isin(selected_types)]
+
+                st.dataframe(filtered_df, use_container_width=True)
+
+                csv_bytes = filtered_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "CSV 다운로드",
+                    data=csv_bytes,
+                    file_name="issues.csv",
+                    mime="text/csv",
+                )
 
 with tab_llm:
     st.info("준비 중입니다")
