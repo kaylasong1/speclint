@@ -17,6 +17,7 @@ extract_pptx.py가 뽑은 out/screens.json을 훑어서 사람이 눈으로 찾�
 import argparse
 import csv
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -24,6 +25,21 @@ FIELDNAMES = ["slide_id", "screen_name", "issue_type", "detail"]
 
 # 이 어휘가 포함된 텍스트 블록이 있으면 "기능 정의로 보이는 페이지"로 판단한다.
 FUNCTIONAL_KEYWORDS = ["클릭 시", "노출", "이동", "버튼", "팝업"]
+
+# 본문(blocks) 앞쪽에 이 표시가 있으면 스코프 아웃된 장표로 본다.
+# 설명 표(description_blocks)에는 원래 기획 내용이 그대로 남아 있어서
+# 정상 화면과 구분이 안 되므로, 반드시 본문 좌측 상단을 봐야 한다.
+DESCOPED_KEYWORDS = ["미진행", "미적용", "대상 제외", "제외되어", "보류",
+                     "삭제됨", "해당 없음", "해당없음", "차수 이관",
+                     "그대로 유지", "추가하지 않는"]
+
+# 스코프 아웃 표시를 찾을 때 볼 본문 블록 수(좌측 상단 몇 개).
+DESCOPED_HEAD_BLOCKS = 3
+
+# 설명 표의 항목 번호("1 | ...", "2 | ...")를 읽기 위한 패턴.
+# 설명이 길어 다음 장표로 넘긴 경우 번호가 이어지므로(1,2 -> 3),
+# 같은 화면코드·화면명이 두 장표에 있어도 중복이 아니라 '분할'로 본다.
+ITEM_NUMBER_RE = re.compile(r"^\s*(\d{1,2})\s*\|")
 
 # 표지·목차 등 짧은 페이지를 걸러내기 위한 최소 텍스트 길이.
 MIN_TEXT_LENGTH = 100
@@ -55,20 +71,59 @@ def check_broken_references(screens):
     return issues
 
 
+def item_numbers(screen):
+    """설명 표의 항목 번호 목록. 없으면 빈 리스트."""
+    numbers = []
+    for block in screen.get("description_blocks") or []:
+        for line in block.get("text", "").split("\n"):
+            match = ITEM_NUMBER_RE.match(line)
+            if match:
+                numbers.append(int(match.group(1)))
+    return numbers
+
+
+def is_split_pair(prev_screen, next_screen):
+    """앞 장표에서 이어서 쓴 '분할 장표'인지 판단한다.
+
+    조건 두 가지를 모두 만족해야 한다.
+      1) 슬라이드가 바로 옆에 붙어 있다
+      2) 설명 표의 항목 번호가 이어진다 (앞의 마지막 < 뒤의 처음)
+    번호를 못 읽으면 판단하지 않고 중복으로 남긴다(놓치는 쪽보다 안전).
+    """
+    prev_no = (prev_screen.get("source") or {}).get("slide")
+    next_no = (next_screen.get("source") or {}).get("slide")
+    if prev_no is None or next_no is None or next_no != prev_no + 1:
+        return False
+
+    prev_nums = item_numbers(prev_screen)
+    next_nums = item_numbers(next_screen)
+    if not prev_nums or not next_nums:
+        return False
+    return max(prev_nums) < min(next_nums)
+
+
 def check_duplicate_screens(screens):
-    """screen_code와 screen_name이 둘 다 같은 장표가 2개 이상 있는지 찾는다."""
+    """screen_code와 screen_name이 둘 다 같은 장표가 2개 이상 있는지 찾는다.
+    단, 설명이 길어 다음 장표로 넘긴 '분할 장표'는 중복이 아니다."""
     groups = defaultdict(list)
     for s in screens:
         code = s.get("screen_code")
         name = s.get("screen_name")
         if not code or not name:
             continue
-        groups[(code, name)].append(s["slide_id"])
+        groups[(code, name)].append(s)
 
     issues = []
-    for (code, name), slide_ids in groups.items():
-        if len(slide_ids) < 2:
+    for (code, name), members in groups.items():
+        if len(members) < 2:
             continue
+
+        members = sorted(members, key=lambda s: (s.get("source") or {}).get("slide", 0))
+        # 앞뒤가 전부 '이어 쓴' 관계면 한 화면을 나눠 쓴 것이므로 넘어간다.
+        if all(is_split_pair(a, b) for a, b in zip(members, members[1:])):
+            continue
+
+        slide_ids = [s["slide_id"] for s in members]
         for slide_id in slide_ids:
             others = ", ".join(sid for sid in slide_ids if sid != slide_id)
             issues.append({
@@ -90,12 +145,23 @@ def slide_visible_text(screen):
     return "\n".join(b.get("text", "") for b in blocks)
 
 
+def is_descoped(screen):
+    """'해당 케이스 미진행' 같은 표시가 본문 앞쪽에 있으면 스코프 아웃된 장표."""
+    head = "\n".join(
+        b.get("text", "") for b in (screen.get("blocks") or [])[:DESCOPED_HEAD_BLOCKS]
+    )
+    return any(keyword in head for keyword in DESCOPED_KEYWORDS)
+
+
 def check_missing_screen_code(screens):
     """screen_code가 없는데 화면정의 페이지로 보이는(기능 정의 어휘가 있고
     텍스트가 충분히 긴) 슬라이드를 찾는다."""
     issues = []
     for s in screens:
         if s.get("screen_code"):
+            continue
+        # 작성자가 의도적으로 코드를 뺀 장표(미진행/제외)는 누락이 아니다.
+        if is_descoped(s):
             continue
 
         text = slide_visible_text(s)

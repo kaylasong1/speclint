@@ -28,7 +28,8 @@ VERTICAL_TAB_RE = re.compile("\x0b")
 # 삼켜버리므로 ASCII로 제한한다.
 # 괄호는 "(내용)" 형태로 코드 중간에 붙을 때만 삼키고, 문장에서 코드 전체를
 # 감싸는 바깥쪽 닫는 괄호(...)는 삼키지 않도록 여는/닫는 괄호를 짝지어 매칭한다.
-SCREEN_CODE_RE = re.compile(r"F\.[A-Za-z0-9_.\-]+(?:\([A-Za-z0-9_.\-]+\)[A-Za-z0-9_.\-]*)*")
+DEFAULT_SCREEN_CODE_PATTERN = r"F\.[A-Za-z0-9_.\-]+(?:\([A-Za-z0-9_.\-]+\)[A-Za-z0-9_.\-]*)*"
+SCREEN_CODE_RE = re.compile(DEFAULT_SCREEN_CODE_PATTERN)
 # URL 경로: "/segment"가 2번 이상 이어지고, 각 segment가 영문 소문자·숫자·
 # 하이픈으로만 이뤄진 경우만 인정한다. "현역병사/복지/청소년/3G(CDMA)" 같은
 # 한글 나열 중 "/3G"만 뚝 떼어 오탐하는 걸 막기 위함(segment 1개, 대문자 포함
@@ -40,12 +41,39 @@ URL_RE = re.compile(r"(?<![A-Za-z0-9/:])(?:/[a-z0-9\-]+){2,}(?:\?[A-Za-z0-9_=&%.
 # 슬라이드 상단 이 비율 안에 있는 F. 코드를 그 화면의 "정식" 코드로 본다.
 HEADER_RATIO = 0.2
 
+# --- 표 분류 ---
+# 표를 위치(EMU)만으로 나누면 문서마다 레이아웃이 달라 어긋난다.
+# (실제로 백오피스 문서는 설명 표가 left 7.5M라 아래 8M 기준을 못 넘었다)
+# 그래서 표의 '구조'로 먼저 판단하고, 판단이 안 되는 표만 위치 규칙으로 넘긴다.
+#   설명 표   : 2열이고 첫 열에 항목 번호(1,2,3...)가 있거나 머리행이 화면 경로("A > B")
+#   개정이력 표: 2열이고 첫 열이 전부 코드/버전 토큰(BO_M_0607, V1.4 ...)
+#   그 외      : 본문(화면 목업 안의 데이터 그리드 등)
+TABLE_CODE_CELL_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+TABLE_ITEM_NO_RE = re.compile(r"^\d{1,2}$")
+
 # 이 left(EMU) 이상에 있는 표는 본문이 아니라 슬라이드 오른쪽에 붙는
 # 설명/코멘트 표로 보고 description_blocks로 따로 뺀다.
 DESCRIPTION_LEFT_MIN = 8_000_000
 # 이 left(EMU) 이상은 개정이력 표(V0.1, V0.2 ... 변경사항 기록)라 기능 정의가
 # 아니다. description_blocks에도 넣지 않고 통째로 제외한다.
 REVISION_LEFT_MIN = 11_000_000
+
+
+def classify_table(rows):
+    """표를 'description' / 'revision' / 'body'로 나눈다. 판단 불가면 'body'."""
+    if not rows:
+        return "body"
+    if max(len(r) for r in rows) != 2:
+        return "body"
+
+    firsts = [(r[0] or "").strip() for r in rows if (r[0] or "").strip()]
+    if not firsts:
+        return "body"
+    if all(TABLE_CODE_CELL_RE.match(c) for c in firsts):
+        return "revision"
+    if any(TABLE_ITEM_NO_RE.match(c) for c in firsts) or ">" in firsts[0]:
+        return "description"
+    return "body"
 
 
 def normalize_text(text):
@@ -87,17 +115,18 @@ def read_order_key(item):
     return (top // ROW_TOLERANCE, left)
 
 
-def find_header_screen_code(blocks, block_tops, slide_height):
+def find_header_screen_code(blocks, block_tops, slide_height, code_re=None):
     """
     슬라이드 상단 HEADER_RATIO(20%) 안에 있는 블록 중 읽는 순서상 가장 먼저
     나오는 F. 코드를 그 화면의 screen_code로 본다. 라벨 텍스트에 기대지 않고
     순전히 위치로 판단한다.
     """
+    code_re = code_re or SCREEN_CODE_RE
     header_limit = slide_height * HEADER_RATIO
     for bi, (block, top) in enumerate(zip(blocks, block_tops)):
         if top > header_limit:
             continue
-        candidates = SCREEN_CODE_RE.findall(block["text"])
+        candidates = code_re.findall(block["text"])
         if candidates:
             return candidates[0], bi
     return "", None
@@ -111,7 +140,9 @@ def extract_table(shape):
     return rows, text
 
 
-def extract_slide(slide, index, slide_height):
+def extract_slide(slide, index, slide_height, code_re=None):
+    code_re = code_re or SCREEN_CODE_RE
+
     blocks = []
     description_blocks = []  # 오른쪽에 붙는 설명/코멘트 표 (표 + left >= DESCRIPTION_LEFT_MIN)
     block_tops = []  # blocks와 같은 순서로 대응하는 슬라이드 세로 위치(top, EMU)
@@ -134,8 +165,13 @@ def extract_slide(slide, index, slide_height):
             rows, text = extract_table(shape)
             if text.strip():
                 block = {"type": "table", "rows": rows, "text": text, **geometry}
-                if geometry["left"] >= REVISION_LEFT_MIN:
+                kind = classify_table(rows)
+                if kind == "revision":
                     pass  # 개정이력 표: 기능 정의가 아니므로 완전히 제외
+                elif kind == "description":
+                    description_blocks.append(block)
+                elif geometry["left"] >= REVISION_LEFT_MIN:
+                    pass  # 구조로 판단 안 되는 표는 기존 위치 규칙으로 보조 판정
                 elif geometry["left"] >= DESCRIPTION_LEFT_MIN:
                     description_blocks.append(block)
                 else:
@@ -160,7 +196,9 @@ def extract_slide(slide, index, slide_height):
 
     # screen_code: 상단 헤더 영역에서 찾은 F. 코드. screen_name: 그 코드
     # 바로 앞 텍스트 블록. 헤더에 코드가 없으면 둘 다 빈 값으로 둔다.
-    screen_code, code_block_index = find_header_screen_code(blocks, block_tops, slide_height)
+    screen_code, code_block_index = find_header_screen_code(
+        blocks, block_tops, slide_height, code_re
+    )
     if code_block_index is not None and code_block_index > 0:
         screen_name = blocks[code_block_index - 1]["text"].split("\n")[0].strip()
     else:
@@ -171,7 +209,7 @@ def extract_slide(slide, index, slide_height):
 
     # 헤더에서 뽑은 코드를 제외한 나머지 F. 코드(다른 화면 참조 등)는
     # referenced_codes로 분리한다.
-    all_codes = dedupe_preserve_order(SCREEN_CODE_RE.findall(all_text))
+    all_codes = dedupe_preserve_order(code_re.findall(all_text))
     referenced_codes = [c for c in all_codes if c != screen_code]
 
     return {
@@ -192,7 +230,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input", help="화면정의서 .pptx 경로")
     parser.add_argument("-o", "--output", default="screens.json")
+    parser.add_argument(
+        "--code-pattern",
+        default=DEFAULT_SCREEN_CODE_PATTERN,
+        help="화면코드 정규식. detect_code_pattern.py가 추천한 값을 넣는다. "
+             "기본값은 'F.'로 시작하는 코드 체계.",
+    )
     args = parser.parse_args()
+
+    code_re = re.compile(args.code_pattern)
 
     prs = Presentation(args.input)
     src = Path(args.input).name
@@ -200,7 +246,7 @@ def main():
 
     screens = []
     for i, slide in enumerate(prs.slides, start=1):
-        screen = extract_slide(slide, i, slide_height)
+        screen = extract_slide(slide, i, slide_height, code_re)
         screen["source"]["file"] = src
         screens.append(screen)
 
@@ -212,7 +258,12 @@ def main():
     total_blocks = sum(len(s["blocks"]) for s in screens)
     total_unreadable = sum(len(s["unreadable_shapes"]) for s in screens)
     print(f"슬라이드 {len(screens)}개 / 텍스트 블록 {total_blocks}개 -> {args.output}")
+    with_code = sum(1 for s in screens if s["screen_code"])
     print(f"텍스트를 못 읽은 도형(이미지·차트) {total_unreadable}개")
+    print(f"화면코드가 잡힌 슬라이드 {with_code}개 (패턴: {args.code_pattern[:60]})")
+    if with_code == 0:
+        print("  [확인 필요] 화면코드를 하나도 못 찾았습니다. "
+              "detect_code_pattern.py로 이 문서의 코드 패턴을 확인하세요.")
     for s in screens:
         if not s["blocks"]:
             print(f"  [확인 필요] {s['slide_id']} 텍스트가 하나도 안 잡힘")
